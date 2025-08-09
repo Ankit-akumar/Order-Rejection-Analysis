@@ -36,7 +36,7 @@ grep -oP '"[^"]+":\s*}' executeBulkRequest.json | while read -r line; do
   echo "Missing value for key: $key — replacing with null"
 done
 
-sed -i 's/\("[^"]*"\):[[:space:]]*}/\1: null}/g' executeBulkRequest.json
+sed -i 's/\("[^"]*"\):[[:space:]]*}/\1: "null_ptr"}/g' executeBulkRequest.json
 
 ###############
 
@@ -106,57 +106,65 @@ for json in "${missing_orders_data_array[@]}"; do
  skus=$(echo "$json" | jq -r 'select(.product_skus) | .product_skus[]')
 
  if [[ -n "$skus" ]]; then
-   # Convert to single-quoted, comma-separated list
-   sku_list=()
-   while IFS= read -r sku; do
-     sku_list+=("'$sku'")
-   done <<< "$skus"
+  # Convert to single-quoted, comma-separated list
+  sku_list=()
+  while IFS= read -r sku; do
+    sku_list+=("'$sku'")
+  done <<< "$skus"
 
-   sql_sku_list=$(IFS=,; echo "${sku_list[*]}")
+  sql_sku_list=$(IFS=,; echo "${sku_list[*]}")
 
-   # Get missing sku
-   readarray -t missing_sku < <(PGPASSWORD=1f23c9fe0381aef1 psql -h 10.170.247.9 -U postgres -d wms_masterdata -t -A -c "select sku as missing_sku from unnest(array[${sql_sku_list}]) as sku(sku) left join item i on i.productattributes->>'product_sku' = sku where i.id is null;")
-   echo "Missing SKU in External Service Request ID: $id:"
-   for i in "${missing_sku[@]}"; do
-       echo "$i"
-   done
+  # Get missing sku
+  readarray -t missing_sku < <(PGPASSWORD=1f23c9fe0381aef1 psql -h 10.170.247.9 -U postgres -d wms_masterdata -t -A -c "select sku as missing_sku from unnest(array[${sql_sku_list}]) as sku(sku) left join item i on i.productattributes->>'product_sku' = sku where i.id is null;")
+    if (( ${#missing_sku[@]} != 0 )); then
+    t=$(echo "$json" | jq -r '.type')
+    pn=$(echo "$json" | jq -r '.pallet_number')
+    p_id=$(echo "$(grep "$id" executeBulkRequest.csv)" | awk -F'generic,' '{split($2,a,","); print a[1]}')
+    error_log=$(grep "$p_id" errorOrder.json)
+
+    echo -e "\nMissing SKU in External Service Request ID: $id, type=$t, pallet_number=$pn"
+    for i in "${missing_sku[@]}"; do
+        echo "$i"
+    done
+    echo "$error_log"
+    fi
  fi
 done
 
 
-
 echo -e "\nGetting Pallet height exceed rejections..."
+
 
 mapfile -t process_ids < <(awk -F 'generic,' '/Pallet height exceeds the maximum limit/ {split($2,a,","); print a[1]}' errorOrder.json)
 
 if [ ${#process_ids[@]} -eq 0 ]; then
   echo "No pallet was rejected due to height exceed limit error"
 else
-  pattern_file=$(printf "%s\n" "${process_ids[@]}")
-  
-  mapfile -t pallet_height_error_request_array < <(grep -F -f <(echo "$pattern_file") executeBulkRequest.csv)
-
-  #printf "%s\n" "${pallet_height_error_request_array[@]}"
-  for request in "${pallet_height_error_request_array[@]}";do
-    ext_id=$(echo "$request" | awk -F'{data={' '{split($2,b,","); print b[1]}')
-    ext_id=$(echo "$request" | awk -F'externalServiceRequestId"": ""' '{split($2, uuid, "\""); print uuid[1]}')
-
-    if [ -n "$ext_id" ]; then
-      #printf "%s\n" "$ext_id"
-      request_attributes=$(jq -c --arg ext_id "$ext_id" '
-      .[] 
-      | select(.externalServiceRequestId == $ext_id)
-      |
-        {
-          type,
-          externalServiceRequestId,
-          pallet_number: (.attributes.pallet_number // .attributes.order_options.pallet_number)
-        }
-      ' executeBulkRequest.json)
-      printf "%s\n" "$request_attributes"
+  for process_id in "${process_ids[@]}"; do
+    
+    request=$(grep -F "$process_id" executeBulkRequest.csv)
+    
+    if [ -n "$request" ]; then
+      ext_id=$(echo "$request" | awk -F'externalServiceRequestId"": ""' '{split($2, uuid, "\""); print uuid[1]}')
+      
+      if [ -n "$ext_id" ]; then
+        request_attributes=$(jq -c --arg ext_id "$ext_id" '
+        .[]
+        | select(.externalServiceRequestId == $ext_id)
+        |
+          {
+            type,
+            externalServiceRequestId,
+            pallet_number: (.attributes.pallet_number // .attributes.order_options.pallet_number)
+          }
+        ' executeBulkRequest.json)
+        printf "%s\n" "$request_attributes"
+	echo "$(grep -F "$process_id" errorOrder.json)"
+      else
+        echo "Warning: Could not extract externalServiceRequestId from line: $request"
+      fi
     else
-      echo "Warning: Could not extract externalServiceRequestId from line: $request"
+      echo "Warning: Could not find the bulk request for process ID: $process_id"
     fi
   done
 fi
-
