@@ -3,7 +3,23 @@
 # Clear files
 > errorOrder.json
 > executeBulkRequest.json
-> ids.txt
+
+# Write to output csv
+echo "Order type,Order id,Received_on (utc),Pallet number,Rejection Category,Logs" > output.csv
+function write_to_csv () {
+  local json="$1"
+  local id=$(echo "$json" | jq -r '.externalServiceRequestId')
+  local t=$(echo "$json" | jq -r '.type')
+  local pn=$(echo "$json" | jq -r '.pallet_number')
+  local p_id=$(echo "$(grep -m 1 "$id" executeBulkRequest.csv)" | awk -F'generic,' '{split($2,a,","); print a[1]}')
+  local error_log=$(grep "$p_id" errorOrder.json)
+  local received_at=$(echo "$error_log" | grep -o '[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}T[0-9]\{2\}:[0-9]\{2\}:[0-9]\{2\}\.[0-9]\{3\}Z' | head -n 1)
+  local message="$2"
+
+  printf -v line "%s,%s,%s,%s,%s,%s" "$t" "$id" "$received_at" "$pn" "$message" "$error_log"
+  echo "$line" >> output.csv
+}
+
 
 # Filter known errors
 grep -v -e 'Zone location not found for' -e 'is not serviceable' -e 'InProgress Task Found' errorOrder.csv > errorOrder.json
@@ -33,7 +49,7 @@ sed 's/""/"/g; s/\\u0027/'"'"'/g' tmpfile_raw > tmpfile_clean
 echo "Checking for missing values in JSON..."
 grep -oP '"[^"]+":\s*}' executeBulkRequest.json | while read -r line; do
   key=$(echo "$line" | grep -oP '"[^"]+"')
-  echo "Missing value for key: $key — replacing with null"
+  echo "Missing value for key: $key — replacing with null_ptr"
 done
 
 sed -i 's/\("[^"]*"\):[[:space:]]*}/\1: "null_ptr"}/g' executeBulkRequest.json
@@ -96,44 +112,76 @@ missing_orders_data_array=($(printf "%s\n" "${missing_orders_data_array[@]}" | s
 
 #printf "%s\n" "${missing_orders_data_array[@]}" | jq -s .
 
+echo -e "\nVerifying locations..."
+
+for json in "${missing_orders_data_array[@]}"; do
+  id=$(echo "$json" | jq -r '.externalServiceRequestId')
+  locations=()
+  while IFS= read -r loc; do
+    locations+=("$loc")
+  done < <(echo "$json" | jq -r 'select(.fullAddresses) | .fullAddresses[]')
+
+  if [[ "${#locations[@]}" -gt 0 ]]; then
+    declare -i ctr=1
+    test_json="{}"
+    
+    for loc in "${locations[@]}"; do
+      test_loc=$(echo "$loc" | cut -d '-' -f 1-2)
+      test_json=$(echo "$test_json" | jq --arg key "$test_loc" --argjson value "$ctr" '. + { ($key): $value }')
+      ((ctr++))
+    done
+    invalid_locations=$(curl --silent --location 'https://adams-internal.greymatter.greyorange.com/zone-manager/api/v1/validate/locations' \
+    --header 'accept: application/json' \
+    --header 'Content-Type: application/json' \
+    --header 'X-CSRFToken: LbIOP1XgXuWt3m1b9D35KZzFvYychlIkIqrB8SLQImo4jyOuNMMWhtezvEQsLj0Z' \
+    --data "$test_json" | jq -r '.invalid_locations[]')
+
+    if [[ -n "$invalid_locations" ]]; then
+      invalid_locations_string="Invalid locations - $invalid_locations"
+      write_to_csv "$json" "$invalid_locations_string"
+    fi
+  fi
+done
 
 
 echo -e "\nVerifying skus in pick requests..."
 
 for json in "${missing_orders_data_array[@]}"; do
- id=$(echo "$json" | jq -r '.externalServiceRequestId')
-
- skus=$(echo "$json" | jq -r 'select(.product_skus) | .product_skus[]')
-
- if [[ -n "$skus" ]]; then
-  # Convert to single-quoted, comma-separated list
+  id=$(echo "$json" | jq -r '.externalServiceRequestId')
   sku_list=()
   while IFS= read -r sku; do
-    sku_list+=("'$sku'")
-  done <<< "$skus"
+    sku_list+=("\"$sku\"")
+  done < <(echo "$json" | jq -r 'select(.product_skus) | .product_skus[]')
 
-  sql_sku_list=$(IFS=,; echo "${sku_list[*]}")
+  if [[ ${#sku_list[@]} -gt 0 ]]; then
+    json_sku_list=$(printf "%s," "${sku_list[@]}")
+    json_sku_list=${json_sku_list%,}
+    data_payload="{\"filter_params\": [{\"key\": \"product_sku\",\"operator\": \"in\",\"value\": [${json_sku_list}]}]}"
 
-  # Get missing sku
-  readarray -t missing_sku < <(PGPASSWORD=1f23c9fe0381aef1 psql -h 10.170.247.9 -U postgres -d wms_masterdata -t -A -c "select sku as missing_sku from unnest(array[${sql_sku_list}]) as sku(sku) left join item i on i.productattributes->>'product_sku' = sku where i.id is null;")
-    if (( ${#missing_sku[@]} != 0 )); then
-    t=$(echo "$json" | jq -r '.type')
-    pn=$(echo "$json" | jq -r '.pallet_number')
-    p_id=$(echo "$(grep "$id" executeBulkRequest.csv)" | awk -F'generic,' '{split($2,a,","); print a[1]}')
-    error_log=$(grep "$p_id" errorOrder.json)
+    valid_skus=$(curl --silent --location 'https://adams-internal.greymatter.greyorange.com/api-gateway/mdm-service/wms-masterdata/item/search_v2' \
+    --header 'Content-Type: application/json' \
+    --data "$data_payload" | jq -r '.[].productAttributes.product_sku')
 
-    echo -e "\nMissing SKU in External Service Request ID: $id, type=$t, pallet_number=$pn"
-    for i in "${missing_sku[@]}"; do
-        echo "$i"
+    missing_sku=()
+    for quoted_sku in "${sku_list[@]}"; do
+      sku=$(echo "$quoted_sku" | tr -d '"')
+      if ! echo "$valid_skus" | grep -q "^$sku$"; then
+        missing_sku+=("$sku")
+      fi
     done
-    echo "$error_log"
+
+    if (( ${#missing_sku[@]} != 0 )); then
+      #Writing error to output.csv
+      missing_sku_string=$(printf " %s" "${missing_sku[@]}")
+      missing_sku_string="Missing SKU in MDM -${missing_sku_string}"
+      write_to_csv "$json" "$missing_sku_string"
     fi
- fi
+  fi
 done
 
 
-echo -e "\nGetting Pallet height exceed rejections..."
 
+echo -e "\nGetting Pallet height exceed rejections..."
 
 mapfile -t process_ids < <(awk -F 'generic,' '/Pallet height exceeds the maximum limit/ {split($2,a,","); print a[1]}' errorOrder.json)
 
@@ -168,3 +216,19 @@ else
     fi
   done
 fi
+
+
+
+
+  # if [[ -n "$skus" ]]; then
+    # Convert to single-quoted, comma-separated list
+    # sku_list=()
+    ## Getting SKUs from wms masterdata database
+    # while IFS= read -r sku; do
+    #   sku_list+=("'$sku'")
+    # done <<< "$skus"
+
+    # sql_sku_list=$(IFS=,; echo "${sku_list[*]}")
+
+    # # Get missing sku
+    # readarray -t missing_sku < <(PGPASSWORD=1f23c9fe0381aef1 psql -h 10.170.247.9 -U postgres -d wms_masterdata -t -A -c "select sku as missing_sku from unnest(array[${sql_sku_list}]) as sku(sku) left join item i on i.productattributes->>'product_sku' = sku where i.id is null;")
