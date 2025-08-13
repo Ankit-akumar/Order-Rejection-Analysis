@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 
 # Clear files
-> errorOrder.json
 > executeBulkRequest.json
 
 # Write to output csv
@@ -12,7 +11,7 @@ function write_to_csv () {
   local t=$(echo "$json" | jq -r '.type')
   local pn=$(echo "$json" | jq -r '.pallet_number')
   local p_id=$(echo "$(grep -m 1 "$id" executeBulkRequest.csv)" | awk -F'generic,' '{split($2,a,","); print a[1]}')
-  local error_log=$(grep "$p_id" errorOrder.json)
+  local error_log=$(grep "$p_id" errorOrder.csv)
   local received_at=$(echo "$error_log" | grep -o '[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}T[0-9]\{2\}:[0-9]\{2\}:[0-9]\{2\}\.[0-9]\{3\}Z' | head -n 1)
   local message="$2"
 
@@ -20,12 +19,8 @@ function write_to_csv () {
   echo "$line" >> output.csv
 }
 
-
-# Filter known errors
-grep -v -e 'Zone location not found for' -e 'is not serviceable' -e 'InProgress Task Found' errorOrder.csv > errorOrder.json
-
 # Get all the IDs from error logs
-awk -F'generic,' '{split($2, a, ","); print a[1]}' errorOrder.json | sort -u > ids.txt
+awk -F'generic,' '{split($2, a, ","); print a[1]}' errorOrder.csv | sort -u > ids.txt
 
 # Grep all error IDs from bulk request
 grep -Fwf ids.txt executeBulkRequest.csv > executeBulkRequest.json
@@ -67,11 +62,6 @@ errorOrder_array=$(jq -r '.[].externalServiceRequestId' executeBulkRequest.json 
 # Get missing orders in SRMS from the external ids array
 readarray -t missing_orders < <(PGPASSWORD=1f23c9fe0381aef1 psql -h 10.170.247.9 -U postgres -d platform_srms -t -A -c "SELECT missing_id FROM unnest(array[($errorOrder_array)]) AS missing_id LEFT JOIN service_request sr ON sr.external_service_request_id = missing_id WHERE sr.id IS NULL;")
 
-# echo "Missing IDs:"
-# for id in "${missing_orders[@]}"; do
-#   echo "$id"
-# done
-
 # Collecting data of the missing orders from bulk request json objects
 missing_orders_data_array=()
 
@@ -88,7 +78,7 @@ for id in "${missing_orders[@]}"; do
           product_skus: (
             [ .serviceRequests[].expectations.containers[].products[].productAttributes.filter_parameters[] ]
             | map(
-                sub("product_sku *= *'"'"'"; "") 
+                sub("product_sku *= *'"'"'"; "")
                 | sub("'"'"'"; "")
               )
           )
@@ -124,7 +114,7 @@ for json in "${missing_orders_data_array[@]}"; do
   if [[ "${#locations[@]}" -gt 0 ]]; then
     declare -i ctr=1
     test_json="{}"
-    
+
     for loc in "${locations[@]}"; do
       test_loc=$(echo "$loc" | cut -d '-' -f 1-2)
       test_json=$(echo "$test_json" | jq --arg key "$test_loc" --argjson value "$ctr" '. + { ($key): $value }')
@@ -183,18 +173,18 @@ done
 
 echo -e "\nGetting Pallet height exceed rejections..."
 
-mapfile -t process_ids < <(awk -F 'generic,' '/Pallet height exceeds the maximum limit/ {split($2,a,","); print a[1]}' errorOrder.json)
+mapfile -t process_ids < <(awk -F 'generic,' '/Pallet height exceeds the maximum limit/ {split($2,a,","); print a[1]}' errorOrder.csv)
 
 if [ ${#process_ids[@]} -eq 0 ]; then
   echo "No pallet was rejected due to height exceed limit error"
 else
   for process_id in "${process_ids[@]}"; do
-    
+
     request=$(grep -F "$process_id" executeBulkRequest.csv)
-    
+
     if [ -n "$request" ]; then
       ext_id=$(echo "$request" | awk -F'externalServiceRequestId"": ""' '{split($2, uuid, "\""); print uuid[1]}')
-      
+
       if [ -n "$ext_id" ]; then
         request_attributes=$(jq -c --arg ext_id "$ext_id" '
         .[]
@@ -206,8 +196,7 @@ else
             pallet_number: (.attributes.pallet_number // .attributes.order_options.pallet_number)
           }
         ' executeBulkRequest.json)
-        printf "%s\n" "$request_attributes"
-	echo "$(grep -F "$process_id" errorOrder.json)"
+	      write_to_csv "$request_attributes" "Breach max height"
       else
         echo "Warning: Could not extract externalServiceRequestId from line: $request"
       fi
@@ -216,19 +205,3 @@ else
     fi
   done
 fi
-
-
-
-
-  # if [[ -n "$skus" ]]; then
-    # Convert to single-quoted, comma-separated list
-    # sku_list=()
-    ## Getting SKUs from wms masterdata database
-    # while IFS= read -r sku; do
-    #   sku_list+=("'$sku'")
-    # done <<< "$skus"
-
-    # sql_sku_list=$(IFS=,; echo "${sku_list[*]}")
-
-    # # Get missing sku
-    # readarray -t missing_sku < <(PGPASSWORD=1f23c9fe0381aef1 psql -h 10.170.247.9 -U postgres -d wms_masterdata -t -A -c "select sku as missing_sku from unnest(array[${sql_sku_list}]) as sku(sku) left join item i on i.productattributes->>'product_sku' = sku where i.id is null;")
