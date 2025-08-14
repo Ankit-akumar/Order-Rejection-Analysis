@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 
-# Clear files
+# set up files
 > executeBulkRequest.json
+bulk_requests_file="Bulk requests.csv"
+error_orders_file="Error Requests.csv"
 
 # Write to output csv
 echo "Order type,Order id,Received_on (utc),Pallet number,Rejection Category,Logs" > output.csv
@@ -10,8 +12,8 @@ function write_to_csv () {
   local id=$(echo "$json" | jq -r '.externalServiceRequestId')
   local t=$(echo "$json" | jq -r '.type')
   local pn=$(echo "$json" | jq -r '.pallet_number')
-  local p_id=$(echo "$(grep -m 1 "$id" executeBulkRequest.csv)" | awk -F'generic,' '{split($2,a,","); print a[1]}')
-  local error_log=$(grep "$p_id" errorOrder.csv)
+  local p_id=$(echo "$(grep -m 1 "$id" "${bulk_requests_file}")" | awk -F'generic,' '{split($2,a,","); print a[1]}')
+  local error_log=$(grep "$p_id" "${error_orders_file}")
   local received_at=$(echo "$error_log" | grep -o '[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}T[0-9]\{2\}:[0-9]\{2\}:[0-9]\{2\}\.[0-9]\{3\}Z' | head -n 1)
   local message="$2"
 
@@ -20,10 +22,10 @@ function write_to_csv () {
 }
 
 # Get all the IDs from error logs
-awk -F'generic,' '{split($2, a, ","); print a[1]}' errorOrder.csv | sort -u > ids.txt
+awk -F'generic,' '{split($2, a, ","); print a[1]}' "${error_orders_file}" | sort -u > ids.txt
 
 # Grep all error IDs from bulk request
-grep -Fwf ids.txt executeBulkRequest.csv > executeBulkRequest.json
+grep -Fwf ids.txt "${bulk_requests_file}" > executeBulkRequest.json
 
 # Creating json objects from bulk requests
 awk '{
@@ -173,14 +175,14 @@ done
 
 echo -e "\nGetting Pallet height exceed rejections..."
 
-mapfile -t process_ids < <(awk -F 'generic,' '/Pallet height exceeds the maximum limit/ {split($2,a,","); print a[1]}' errorOrder.csv)
+mapfile -t process_ids < <(awk -F 'generic,' '/Pallet height exceeds the maximum limit/ {split($2,a,","); print a[1]}' "${error_orders_file}")
 
 if [ ${#process_ids[@]} -eq 0 ]; then
   echo "No pallet was rejected due to height exceed limit error"
 else
   for process_id in "${process_ids[@]}"; do
 
-    request=$(grep -F "$process_id" executeBulkRequest.csv)
+    request=$(grep -F "$process_id" "${bulk_requests_file}")
 
     if [ -n "$request" ]; then
       ext_id=$(echo "$request" | awk -F'externalServiceRequestId"": ""' '{split($2, uuid, "\""); print uuid[1]}')
