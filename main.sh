@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# set up files
+# Clear files
 > executeBulkRequest.json
 bulk_requests_file="Bulk requests.csv"
 error_orders_file="Error Requests.csv"
@@ -186,6 +186,9 @@ else
 
     if [ -n "$request" ]; then
       ext_id=$(echo "$request" | awk -F'externalServiceRequestId"": ""' '{split($2, uuid, "\""); print uuid[1]}')
+      if [ -z "$ext_id" ]; then
+	ext_id=$(echo "$request" | awk -F'externalServiceRequestId"":""' '{split($2, uuid, "\""); print uuid[1]}')
+      fi
 
       if [ -n "$ext_id" ]; then
         request_attributes=$(jq -c --arg ext_id "$ext_id" '
